@@ -698,6 +698,10 @@ def run_llm_loop(
 
             # Fallback to another model if primary model returns empty responses
             if msg is None:
+                log.error(
+                    "LLM call returned no message after retries. Triggering fallback. model=%s round=%s",
+                    active_model, round_idx,
+                )
                 # Configurable fallback priority list (Bible P3: no hardcoded behavior)
                 fallback_list_raw = os.environ.get(
                     "OUROBOROS_MODEL_FALLBACK_LIST",
@@ -910,6 +914,11 @@ def _call_llm_with_retry(
 
         except Exception as e:
             last_error = e
+            log.error(
+                "LLM API Error: model=%s round=%s attempt=%s/%s error=%s",
+                model, round_idx, attempt + 1, max_retries, repr(e),
+                exc_info=True,
+            )
             append_jsonl(drive_logs / "events.jsonl", {
                 "ts": utc_now_iso(), "type": "llm_api_error",
                 "task_id": task_id,
@@ -919,6 +928,11 @@ def _call_llm_with_retry(
             if attempt < max_retries - 1:
                 time.sleep(min(2 ** attempt * 2, 30))
 
+    if last_error is not None:
+        log.error(
+            "LLM retries exhausted for model=%s round=%s after %s attempts. Last error: %s",
+            model, round_idx, max_retries, repr(last_error),
+        )
     return None, 0.0
 
 

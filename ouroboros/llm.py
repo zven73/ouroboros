@@ -1,12 +1,13 @@
 """
 Ouroboros — LLM client.
 
-The only module that communicates with the LLM API (OpenRouter).
+The only module that communicates with external LLM APIs.
 Contract: chat(), default_model(), available_models(), add_usage().
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -15,6 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger(__name__)
 
 DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
+GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
@@ -103,36 +106,209 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
 
 
 class LLMClient:
-    """OpenRouter API wrapper. All LLM calls go through this class."""
+    """LLM API wrapper. Routes Gemini models to Google; others to OpenRouter."""
 
     def __init__(
         self,
         api_key: Optional[str] = None,
-        base_url: str = "https://openrouter.ai/api/v1",
+        base_url: str = OPENROUTER_BASE_URL,
     ):
-        self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        self._base_url = base_url
-        self._client = None
+        self._openrouter_api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        self._openrouter_base_url = base_url
+        self._openrouter_client = None
+        self._gemini_client = None
 
-    def _get_client(self):
-        if self._client is None:
+    @staticmethod
+    def _is_gemini_model(model: str) -> bool:
+        return "gemini" in str(model or "").strip().lower()
+
+    @staticmethod
+    def _normalize_gemini_model_name(model: str) -> str:
+        """
+        Strip provider prefixes before calling Google's OpenAI-compatible endpoint.
+
+        Examples:
+        - gemini/gemini-3.1-pro-preview -> gemini-3.1-pro-preview
+        - google/gemini-2.5-pro -> gemini-2.5-pro
+        """
+        name = str(model or "").strip()
+        if not name:
+            return name
+
+        # Remove common provider wrappers first.
+        while "/" in name:
+            head, tail = name.split("/", 1)
+            if head.lower() in {"google", "gemini", "models", "openrouter"}:
+                name = tail
+                continue
+            break
+
+        # If any segment still contains a Gemini model ID, keep that segment.
+        if "/" in name:
+            for seg in name.split("/"):
+                if seg.lower().startswith("gemini"):
+                    return seg
+        return name
+
+    @staticmethod
+    def _infer_schema_type_from_value(value: Any) -> str:
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "number"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, dict):
+            return "object"
+        return "string"
+
+    @classmethod
+    def _sanitize_json_schema_for_gemini(cls, schema: Any) -> None:
+        """Mutate JSON schema in-place to satisfy Gemini's strict validator."""
+        if not isinstance(schema, dict):
+            return
+
+        if schema.get("required") == []:
+            schema.pop("required", None)
+
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            if "type" not in schema:
+                schema["type"] = "object"
+            for key, prop in list(properties.items()):
+                if not isinstance(prop, dict):
+                    properties[key] = {"type": "string"}
+                    continue
+                if "type" not in prop:
+                    if isinstance(prop.get("properties"), dict):
+                        prop["type"] = "object"
+                    elif "items" in prop:
+                        prop["type"] = "array"
+                    elif isinstance(prop.get("default"), (bool, int, float, str, list, dict)):
+                        prop["type"] = cls._infer_schema_type_from_value(prop["default"])
+                    elif isinstance(prop.get("enum"), list) and prop["enum"]:
+                        prop["type"] = cls._infer_schema_type_from_value(prop["enum"][0])
+                    else:
+                        prop["type"] = "string"
+                cls._sanitize_json_schema_for_gemini(prop)
+
+        if "items" in schema:
+            if "type" not in schema:
+                schema["type"] = "array"
+            items = schema["items"]
+            if isinstance(items, dict):
+                if "type" not in items and isinstance(items.get("properties"), dict):
+                    items["type"] = "object"
+                cls._sanitize_json_schema_for_gemini(items)
+            elif isinstance(items, list):
+                for item in items:
+                    cls._sanitize_json_schema_for_gemini(item)
+
+        for key in ("anyOf", "allOf", "oneOf"):
+            variants = schema.get(key)
+            if isinstance(variants, list):
+                for variant in variants:
+                    cls._sanitize_json_schema_for_gemini(variant)
+
+        additional = schema.get("additionalProperties")
+        if isinstance(additional, dict):
+            cls._sanitize_json_schema_for_gemini(additional)
+
+    @classmethod
+    def _sanitize_tools_for_gemini(cls, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        sanitized = copy.deepcopy(tools)
+        for tool in sanitized:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function")
+            if isinstance(fn, dict):
+                params = fn.get("parameters")
+                if isinstance(params, dict):
+                    cls._sanitize_json_schema_for_gemini(params)
+        return sanitized
+
+    @staticmethod
+    def _messages_for_gemini(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Convert OpenRouter-friendly message payload into Gemini-compatible format.
+
+        - Flattens multipart system/developer content to plain text.
+        - Removes cache_control keys from content blocks.
+        """
+        normalized: List[Dict[str, Any]] = []
+
+        for original in messages:
+            if not isinstance(original, dict):
+                continue
+            msg = copy.deepcopy(original)
+            role = str(msg.get("role") or "").strip().lower()
+            content = msg.get("content")
+
+            if isinstance(content, list):
+                cleaned_blocks = []
+                for block in content:
+                    if isinstance(block, dict):
+                        block.pop("cache_control", None)
+                    cleaned_blocks.append(block)
+
+                if role in {"system", "developer"}:
+                    parts: List[str] = []
+                    for block in cleaned_blocks:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text" and "text" in block:
+                                parts.append(str(block.get("text") or ""))
+                            elif "text" in block:
+                                parts.append(str(block.get("text") or ""))
+                        elif isinstance(block, str):
+                            parts.append(block)
+                    msg["content"] = "\n\n".join([p for p in parts if p]).strip()
+                else:
+                    msg["content"] = cleaned_blocks
+            elif role in {"system", "developer"} and not isinstance(content, str):
+                msg["content"] = "" if content is None else str(content)
+
+            normalized.append(msg)
+
+        return normalized
+
+    def _get_openrouter_client(self):
+        if self._openrouter_client is None:
             from openai import OpenAI
-            self._client = OpenAI(
-                base_url=self._base_url,
-                api_key=self._api_key,
+            self._openrouter_client = OpenAI(
+                base_url=self._openrouter_base_url,
+                api_key=self._openrouter_api_key,
                 default_headers={
                     "HTTP-Referer": "https://colab.research.google.com/",
                     "X-Title": "Ouroboros",
                 },
             )
-        return self._client
+        return self._openrouter_client
+
+    def _get_gemini_client(self):
+        if self._gemini_client is None:
+            from openai import OpenAI
+            gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+            if not gemini_key:
+                raise RuntimeError("GEMINI_API_KEY is not set for Gemini model call")
+            self._gemini_client = OpenAI(
+                base_url=GEMINI_OPENAI_BASE_URL,
+                api_key=gemini_key,
+            )
+        return self._gemini_client
+
+    def _get_client_and_model(self, model: str) -> Tuple[Any, str, bool]:
+        if self._is_gemini_model(model):
+            return self._get_gemini_client(), self._normalize_gemini_model_name(model), True
+        return self._get_openrouter_client(), model, False
 
     def _fetch_generation_cost(self, generation_id: str) -> Optional[float]:
         """Fetch cost from OpenRouter Generation API as fallback."""
         try:
             import requests
-            url = f"{self._base_url.rstrip('/')}/generation?id={generation_id}"
-            resp = requests.get(url, headers={"Authorization": f"Bearer {self._api_key}"}, timeout=5)
+            url = f"{self._openrouter_base_url.rstrip('/')}/generation?id={generation_id}"
+            resp = requests.get(url, headers={"Authorization": f"Bearer {self._openrouter_api_key}"}, timeout=5)
             if resp.status_code == 200:
                 data = resp.json().get("data") or {}
                 cost = data.get("total_cost") or data.get("usage", {}).get("cost")
@@ -140,7 +316,7 @@ class LLMClient:
                     return float(cost)
             # Generation might not be ready yet — retry once after short delay
             time.sleep(0.5)
-            resp = requests.get(url, headers={"Authorization": f"Bearer {self._api_key}"}, timeout=5)
+            resp = requests.get(url, headers={"Authorization": f"Bearer {self._openrouter_api_key}"}, timeout=5)
             if resp.status_code == 200:
                 data = resp.json().get("data") or {}
                 cost = data.get("total_cost") or data.get("usage", {}).get("cost")
@@ -161,35 +337,38 @@ class LLMClient:
         tool_choice: str = "auto",
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Single LLM call. Returns: (response_message_dict, usage_dict with cost)."""
-        client = self._get_client()
+        client, api_model, is_gemini = self._get_client_and_model(model)
         effort = normalize_reasoning_effort(reasoning_effort)
 
-        extra_body: Dict[str, Any] = {
-            "reasoning": {"effort": effort, "exclude": True},
-        }
-
-        # Pin Anthropic models to Anthropic provider for prompt caching
-        if model.startswith("anthropic/"):
-            extra_body["provider"] = {
-                "order": ["Anthropic"],
-                "allow_fallbacks": False,
-                "require_parameters": True,
-            }
-
         kwargs: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
+            "model": api_model,
+            "messages": self._messages_for_gemini(messages) if is_gemini else messages,
             "max_tokens": max_tokens,
-            "extra_body": extra_body,
         }
+
+        if not is_gemini:
+            extra_body: Dict[str, Any] = {
+                "reasoning": {"effort": effort, "exclude": True},
+            }
+            # Pin Anthropic models to Anthropic provider for prompt caching
+            if model.startswith("anthropic/"):
+                extra_body["provider"] = {
+                    "order": ["Anthropic"],
+                    "allow_fallbacks": False,
+                    "require_parameters": True,
+                }
+            kwargs["extra_body"] = extra_body
+
         if tools:
-            # Add cache_control to last tool for Anthropic prompt caching
-            # This caches all tool schemas (they never change between calls)
-            tools_with_cache = [t for t in tools]  # shallow copy
-            if tools_with_cache:
-                last_tool = {**tools_with_cache[-1]}  # copy last tool
-                last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-                tools_with_cache[-1] = last_tool
+            if is_gemini:
+                tools_with_cache = self._sanitize_tools_for_gemini(tools)
+            else:
+                # Add cache_control to last tool for Anthropic prompt caching.
+                tools_with_cache = [t for t in tools]  # shallow copy
+                if tools_with_cache:
+                    last_tool = {**tools_with_cache[-1]}  # copy last tool
+                    last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+                    tools_with_cache[-1] = last_tool
             kwargs["tools"] = tools_with_cache
             kwargs["tool_choice"] = tool_choice
 
@@ -217,8 +396,8 @@ class LLMClient:
                 if cache_write:
                     usage["cache_write_tokens"] = int(cache_write)
 
-        # Ensure cost is present in usage (OpenRouter includes it, but fallback if missing)
-        if not usage.get("cost"):
+        # Ensure cost is present in usage for OpenRouter calls.
+        if (not is_gemini) and (not usage.get("cost")):
             gen_id = resp_dict.get("id") or ""
             if gen_id:
                 cost = self._fetch_generation_cost(gen_id)
